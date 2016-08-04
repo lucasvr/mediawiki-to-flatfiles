@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+
+# Converts a MediaWiki XML dump file to a collection of spam-free (your mileage
+# may vary) flat files.
+#
+# Written by Lucas C. Villa Real <lucasvr@gobolinux.org>
+#
+# Released under the GNU GPL version 3.
+
+import re
+import os
+import sys
+from lxml import etree
+
+def makeWikiClassName(name):
+	return "WikiClass_" + name
+
+class XML:
+	def __init__(self, gpxfile):
+		self.xmlfile = gpxfile
+		self.tree = etree.parse(open(self.xmlfile))
+		self.spammers = None
+		self.classes = {}
+
+	def setSpammerDomains(self, domains):
+		regex = "|".join(domains)
+		self.spammers = re.compile(regex)
+		self.spammerdomains = domains
+	
+	def __blacklisted(self, obj):
+		# <table_structure name="archive">
+		if hasattr(obj, "ar_title") and obj.ar_title == "Set_external_mailto_handler_in_Firefox":
+			# ignore
+			return True
+		# <table_structure name="text">
+		elif hasattr(obj, "old_id") and int(obj.old_id) <= 1366:
+			# entries prior to 1367 are automatically populated by MediaWiki
+			return True
+		# <table_structure name="text">
+		elif hasattr(obj, "old_text") and obj.old_text != None:
+			# check for spam entries
+			text = obj.old_text.lower()
+			if  text.find("viagra") >= 0 or \
+				text.count("\nhttp://") > 1 or \
+				text.count("\n[url=") > 1 or \
+				self.spammers.search(text) != None:
+				return True
+		return False
+
+	def createClasses(self):
+		''' Creates a Python class for each table_structure seen in the XML dump '''
+		for table in self.tree.xpath("//mysqldump/database/table_structure"):
+			classname = makeWikiClassName(table.get("name"))
+			classattrs = dict([(field.get("Field"), "") for field in table.xpath("field")])
+			classattrs["table_data"] = []
+			self.classes[classname] = type(classname, (object,), classattrs)
+
+	def __parseTable(self, tablename):
+		tableclass = self.classes[makeWikiClassName(tablename)]
+		rows = self.tree.xpath("//mysqldump/database/table_data[@name='{0}']/row".format(tablename))
+		for row in rows:
+			obj = tableclass()
+			for field in row.xpath("field"):
+				setattr(obj, field.get("name"), field.text)
+			if not self.__blacklisted(obj):
+				tableclass.table_data.append(obj)
+		return tableclass.table_data
+
+	def __tableData(self, tablename):
+		tableclass = self.classes[makeWikiClassName(tablename)]
+		return tableclass.table_data
+
+	def parse(self, tables):
+		validtables = [
+			"archive", "category", "categorylinks", "change_tag", "external_user",
+			"externallinks", "filearchive", "hitcounter", "image", "imagelinks",
+			"interwiki", "ipblocks", "ipblocks_old", "job", "l10n_cache",
+			"langlinks", "log_search", "logging", "math", "objectcache",
+			"oldimage", "page", "page_props", "page_restrictions", "pagelinks",
+			"protected_titles", "querycache", "querycache_info", "querycachetwo",
+			"recentchanges", "redirect", "revision", "searchindex", "site_stats",
+			"tag_summary", "templatelinks", "text", "trackbacks", "transcache",
+			"updatelog", "user", "user_groups", "user_properties", "valid_tag",
+			"validate", "watchlist"
+		]
+		tabledict = {}
+		for table in tables:
+			if not table in validtables:
+				print("Error: requested table '{0}' is invalid".format(table))
+				return None
+			tabledict[table] = self.__parseTable(table)
+		return tabledict
+
+class Replay:
+	def __init__(self, tabledict):
+		self.tabledict = tabledict
+		self.requiredpages = {}
+
+	def processPageLinks(self):
+		'''
+		Further details on the MediaWiki database layout are given at:
+		https://www.mediawiki.org/wiki/Special:MyLanguage/Manual:Database_layout
+
+		<table_structure name="pagelinks">:
+		    pl_from:      key to the page_id in the "page" table_structure (source)
+			pl_title:     key to the page_title in the "page" table_structure (target)
+		'''
+		pages = self.tabledict["page"]
+		for obj in self.tabledict["pagelinks"]:
+			page_from = [p for p in pages if p.page_id == obj.pl_from]
+			page_to = [p for p in pages if p.page_title == obj.pl_title]
+			# Append page to page.links[] array, creating that array if necessary
+			if len(page_from) == 1 and len(page_to) == 1:
+				page_from, page_to = page_from[0], page_to[0]
+				if not hasattr(page_from, "links"):
+					page_from.links = []
+				page_from.links.append(page_to)
+				# Remember to extract these pages
+				self.requiredpages[page_from.page_title] = page_from
+				self.requiredpages[page_to.page_title] = page_to
+
+	def processCategories(self):
+		'''
+		Further details on the MediaWiki database layout are given at:
+		https://www.mediawiki.org/wiki/Special:MyLanguage/Manual:Database_layout
+
+		<table_structure name="categorylinks">:
+		    cl_from:     key to the page_id in the "page" table_structure
+		    cl_to:       key to the cat_title in the "category" table_structure
+		
+		<table_structure name="category">:
+		    cat_id
+		    cat_title:   category name
+		    cat_pages
+		    cat_subcats
+		
+		<table_structure name="page">:
+		    page_id
+		    page_title:  page title
+			page_latest: key to the rev_id in the "revision" table_structure
+
+		<table_structure name="revision">:
+		    rev_id
+			rev_text_id: key to the od_id in the "text" table_structure
+		
+		<table_structure name="text">:
+		    old_id
+		    old_text:   the text
+		'''
+		categories = self.tabledict["category"]
+		pages = self.tabledict["page"]
+		revisions = self.tabledict["revision"]
+		texts = self.tabledict["text"]
+		pagelinks = self.tabledict["pagelinks"]
+		for obj in self.tabledict["categorylinks"]:
+			page = [p for p in pages if p.page_id == obj.cl_from][0]
+			page_title = page.page_title
+			category_title = obj.cl_to
+			text = self.pageText(page)
+			
+			# Remember to extract this page
+			self.requiredpages[page.page_title] = page
+
+			print("{0} -> {1}".format(category_title, page_title))
+			if len(text):
+				print("---> text={0}".format(text[:20].replace("\n", " ")))
+			if hasattr(page, "links"):
+				for link in page.links:
+					pagelink_text = self.pageText(link)
+					if len(pagelink_text):
+						print("---> link={0}".format(link.page_title))
+						#print("---> link={0}".format(pagelink_text[:20]))
+					# Remember to extract this page
+					self.requiredpages[link.page_title] = link
+			print()
+
+	def processUsers(self):
+		'''
+		<table_structure name="user">:
+		    user_id
+		    user_name
+		    user_real_name
+		    user_email
+		'''
+		pass
+
+	def pageText(self, page):
+		revision = [r for r in self.tabledict["revision"] if r.rev_id == page.page_latest][0]
+		text = [t for t in self.tabledict["text"] if t.old_id == revision.rev_text_id]
+		if len(text):
+			return text[0].old_text
+		return ""
+
+	def writeFile(self, page_title, page_text, filename):
+		if page_text and len(page_text) and not os.path.exists(filename):
+			try:
+				f = open(filename, "w")
+				f.write(page_text)
+				f.close()
+			except FileNotFoundError as e:
+				# pagetitle contains characters that do not translate to a valid file name
+				print("Page {0} could not be saved to disk, skipping it".format(page_title))
+		elif not os.path.exists(filename):
+			print("Page {0} has no text, skipping it".format(page_title))
+
+	def toFlatFiles(self, basedir):
+		self.processPageLinks()
+		self.processCategories()
+
+		# mkdir category_dir/
+		# write category_dir/page_title
+		requiredpages = self.requiredpages.copy()
+		for obj in self.tabledict["categorylinks"]:
+			page = [p for p in self.tabledict["page"] if p.page_id == obj.cl_from][0]
+			page_title = page.page_title
+			category_title = obj.cl_to
+
+			category_dir = os.path.join(basedir, category_title)
+			if not os.path.exists(category_dir):
+				os.mkdir(category_dir)
+			if not os.path.exists(os.path.join(category_dir, page_title)):
+				page_text = self.pageText(requiredpages[page_title])
+				self.writeFile(page_title, page_text, os.path.join(category_dir, page_title + ".mediawiki"))
+
+		# delete written pages from dictionary
+		for obj in self.tabledict["categorylinks"]:
+			page = [p for p in self.tabledict["page"] if p.page_id == obj.cl_from][0]
+			page_title = page.page_title
+			category_title = obj.cl_to
+			if category_dir in requiredpages.keys():
+				del requiredpages[category_dir]
+			if page_title in requiredpages.keys():
+				del requiredpages[page_title]
+
+		# write remaining pages
+		for page_title in requiredpages.keys():
+			page_text = self.pageText(requiredpages[page_title])
+			self.writeFile(page_title, page_text, os.path.join(basedir, page_title + ".mediawiki"))
+
+def main():
+	if len(sys.argv) != 3:
+		print("Syntax: {0} <mysql_dump.xml> <output_directory>".format(sys.argv[0]))
+		sys.exit(1)
+
+	xml = XML(sys.argv[1])
+	xml.setSpammerDomains([
+		"http://([a-zA-Z0-9.\-]+).info",
+		"http://([a-zA-Z0-9.\-]+).ru",
+		"http://([a-zA-Z0-9.\-]+).biz",
+		"http://www.message_*",
+		"0catch.com",
+		"125mb.com",
+		"4.pl",
+		"aceproject.com",
+		"adultfriendfinder.com",
+		"alturl.com",
+		"blogigo.com",
+		"blogs.ebay.com",
+		"cellulite.co.uk",
+		"chueca.com",
+		"community.webglobal.cz",
+		"discountasp.net",
+		"docs.google.com",
+		"dopharmacy.weebly.com",
+		"edazzle.net",
+		"enardy.com",
+		"esnips.com",
+		"ezinearticles.com",
+		"forum.kasinoking.dk",
+		"freeiz.com",
+		"freewebs.com",
+		"funnyhost.com",
+		"google.us",
+		"hostingcheapnet.com",
+		"ifastnet.com",
+		"jamespot.com",
+		"jobscentral.com.sg",
+		"magical-casino.com",
+		"myphotosworld.net",
+		"naacpncnetwork.org",
+		"netguestbook.com",
+		"nethit.pl",
+		"noxedge.com",
+		"ovu.edu",
+		"paydayquid.co.uk",
+		"proover.com",
+		"quizilla.com",
+		"research-service.com",
+		"site.com",
+		"site11.com",
+		"smariogame.com",
+		"theclothing.net",
+		"tinyurl.com",
+		"tripod.com",
+		"typogrfn.net",
+		"url4.net",
+		"users7.nofeehost.com",
+		"webege.com",
+		])
+	xml.createClasses()
+	tabledict = xml.parse(["categorylinks","category","page","revision","text","pagelinks"])
+
+	replay = Replay(tabledict)
+	replay.toFlatFiles(sys.argv[2])
+
+if __name__ == "__main__":
+	main()
